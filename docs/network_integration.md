@@ -111,7 +111,31 @@ Each stage has one artifact that proves it, independent of the stage below.
 
 **Tooling.** A Wireshark Lua dissector (`net/noc_dissector.lua`) decodes the encapsulated format. A Scapy suite (`net/noc_scapy.py`) generates both valid traffic and each error case. A shell script (`net/netns_lab.sh`) builds the routed topology with `ip netns` and `nftables`; no commercial simulator is required. Cisco Packet Tracer cannot be used at all, as it has no path to physical interfaces.
 
-# 25. Open Decisions
+# 25. Stage N1: PS-PL Bridge
+
+`rtl/axil_noc_bridge.sv` is an AXI4-Lite slave that replaces the traffic generator on endpoint 0. The Zynq PS injects and receives flits by register access. Endpoints 1-7 keep their generators, so every PS transaction crosses a contended fabric. Generators never address endpoint 0; software must not send DATA to endpoints 1-7, and should use memory at or above byte 0x1000 (generators occupy words 32·ID to 32·ID+3).
+
+| Offset | Name | Access | Meaning |
+|---|---|---|---|
+| 0x00 | ID | RO | 0x4E4F4331 ("NOC1") |
+| 0x04 | STATUS | RO | [0] tx_space, [1] rx_avail, [2] rx_sop, [3] rx_eop, [15:8] rx_count, [23:16] tx_count |
+| 0x08 | TX_LO | RW | Staged flit bits [31:0] |
+| 0x0C | TX_HI | RW | Staged flit bits [63:32] |
+| 0x10 | TX_PUSH | WO | [0] sop, [1] eop; pushes the staged flit, or counts a drop if full |
+| 0x14 | RX_LO | RO | Head flit bits [31:0], no side effect |
+| 0x18 | RX_HI | RO | Head flit bits [63:32], no side effect |
+| 0x1C | RX_POP | WO | Any value discards the head flit |
+| 0x20 | TX_COUNT | RO | Flits pushed |
+| 0x24 | RX_COUNT | RO | Flits popped |
+| 0x28 | TX_DROP | RO | Pushes rejected because the TX FIFO was full |
+
+A flit costs three bus accesses each way. This is intentionally the slowest path: it proves correctness before the network exists and sets the baseline that AXI-DMA (N7) is measured against.
+
+**Clock.** The PS supplies FCLK_CLK0. The PS derives it by integer division from the IO PLL, so exactly 70 MHz is unavailable; 66.67 MHz is requested, below the fabric's 73.6 MHz ceiling with margin. 71.4 MHz would leave under 0.5 ns.
+
+**Verified in simulation** (`tb/tb_n1_bridge.sv`, `make n1`): ID register; DATA loopback with SRC_ID stamping; memory write and four-word read-back; an E_ALIGN error response; flit counters; generators error-free throughout, with randomized receive backpressure enabled.
+
+# 26. Open Decisions
 
 - Whether the memory endpoint should expose read/write as distinct UDP ports or as a TYPE field in an encapsulated header.
 - Retry and timeout policy: UDP is lossy, the fabric is not. A dropped response currently looks identical to a lost request.

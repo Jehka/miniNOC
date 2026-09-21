@@ -10,7 +10,10 @@ module ep_traffic
   import noc_pkg::*;
 #(
   parameter int          ID   = 0,
-  parameter logic [31:0] SEED = 32'hACE1_0001
+  parameter logic [31:0] SEED = 32'hACE1_0001,
+  // N1: endpoint 0 is the PS bridge, which does not run this checker's protocol,
+  // so generators must not send DATA to it. Remaps destination 0 to 1.
+  parameter bit          AVOID_EP0 = 1'b0
 ) (
   input  logic              clk,
   input  logic              rst_n,
@@ -98,7 +101,9 @@ module ep_traffic
           if (lfsr[4:0] == 5'd0) begin
             kind <= K_WRITE; g_len <= 16'(1 + MEM_WORDS_PER_EP);
           end else begin
-            kind <= K_DATA; g_dst <= {1'b0, lfsr[7:5]}; g_len <= 16'(lfsr[12:8]);
+            kind  <= K_DATA;
+            g_dst <= (AVOID_EP0 && lfsr[7:5] == 3'd0) ? 4'd1 : {1'b0, lfsr[7:5]};
+            g_len <= 16'(lfsr[12:8]);
           end
           gst <= G_HDR;
         end

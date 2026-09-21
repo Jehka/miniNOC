@@ -1,0 +1,13 @@
+# Vivado / build outputs
+build/
+.Xil/
+*.jou
+*.log
+*.str
+*.backup.*
+vivado_*.zip
+
+# Verilator / Python
+obj_dir/
+__pycache__/
+*.pyc

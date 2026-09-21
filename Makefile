@@ -11,11 +11,12 @@ N ?= 9
 DEPTH ?= 16
 SEED ?= 1
 
-all: lint unit regress selftest
+all: lint unit regress selftest n1
 
 lint:
 	$(VERILATOR) --lint-only -Wall -Wno-UNUSEDPARAM --top-module noc_top $(RTL)
 	$(VERILATOR) --lint-only -Wall -Wno-UNUSEDPARAM -Wno-UNUSEDSIGNAL --top-module zed_top $(RTL) fpga/ep_traffic.sv fpga/zed_top.sv
+	$(VERILATOR) --lint-only -Wall -Wno-UNUSEDPARAM -Wno-UNUSEDSIGNAL --top-module n1_top $(RTL) rtl/axil_noc_bridge.sv fpga/ep_traffic.sv fpga/n1_top.sv
 	@echo "LINT CLEAN"
 
 build:
@@ -49,9 +50,14 @@ selftest: build
 	@./build/zed/Vtb_zed_selftest | grep -E "self-test|PASS|FAIL"
 	@./build/zed/Vtb_zed_selftest +inject | grep -E "PASS|FAIL"
 
+N1   = $(RTL) rtl/axil_noc_bridge.sv fpga/ep_traffic.sv fpga/n1_top.sv
+n1: build
+	@$(VERILATOR) $(SIMF) --top-module tb_n1_bridge $(N1) tb/tb_n1_bridge.sv -Mdir build/n1 > build/n1.log 2>&1
+	@./build/n1/Vtb_n1_bridge | grep -E "ok|info|ERROR|PASS|FAIL"
+
 mutate:
 	@bash scripts/mutate.sh
 
 clean:
 	rm -rf build
-.PHONY: all lint build arb fifo sys unit regress selftest mutate clean
+.PHONY: all lint build arb fifo sys unit regress selftest n1 mutate clean
