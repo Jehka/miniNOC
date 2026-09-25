@@ -8,6 +8,8 @@
 #
 #   client ns 10.20.20.2  --veth--  router 10.20.20.1 / 10.10.10.1  --eth--  board 10.10.10.10-.18
 #
+# Replies come back without NAT: the board's default gateway is the router.
+#
 # Run on Linux, or on Windows under WSL2 with mirrored networking so that WSL
 # can see the 10.10.10.1 interface:
 #
@@ -26,7 +28,11 @@
 #   sudo ./net/n6_lab.sh down
 set -euo pipefail
 
-ACTION=${1:?usage: $0 {up|down|acl|noacl|test|run} [args]}
+if [ $# -lt 1 ]; then
+  echo "usage: $0 {up|down|acl|noacl|test|run} [args]"
+  exit 1
+fi
+ACTION=$1
 BOARD_NET=10.10.10.0/24
 CLIENT_NS=noc-client
 FW=iptables            # nftables works too; iptables-nft is the common default
@@ -37,7 +43,7 @@ up() {
   need_root
   ip netns add $CLIENT_NS 2>/dev/null || true
   ip link add v-rtr type veth peer name v-cli 2>/dev/null || true
-  ip link set v-cli netns $CLIENT_NS
+  ip link show v-cli >/dev/null 2>&1 && ip link set v-cli netns $CLIENT_NS
   ip addr add 10.20.20.1/24 dev v-rtr 2>/dev/null || true
   ip link set v-rtr up
   ip netns exec $CLIENT_NS ip addr add 10.20.20.2/24 dev v-cli
@@ -46,18 +52,16 @@ up() {
   ip netns exec $CLIENT_NS ip route add default via 10.20.20.1
 
   sysctl -qw net.ipv4.ip_forward=1
-  # The board has no route back to 10.20.20.0/24, so the router translates the
-  # source address. A real deployment would add a route on the board instead;
-  # masquerading keeps the board's configuration untouched.
-  $FW -t nat -C POSTROUTING -s 10.20.20.0/24 -d $BOARD_NET -j MASQUERADE 2>/dev/null \
-    || $FW -t nat -A POSTROUTING -s 10.20.20.0/24 -d $BOARD_NET -j MASQUERADE
+  # No NAT. The board's default gateway is 10.10.10.1, which is this router, so
+  # it returns replies to 10.20.20.0/24 by itself: verified by deleting the
+  # MASQUERADE rule and finding every endpoint still reachable. Traffic is
+  # therefore routed in both directions, with the addresses left intact.
   echo "up. client namespace $CLIENT_NS at 10.20.20.2, router at 10.20.20.1"
-  echo "traffic to the board now crosses one routing hop."
+  echo "traffic to the board now crosses one routing hop, no NAT."
 }
 
 down() {
   need_root
-  $FW -t nat -D POSTROUTING -s 10.20.20.0/24 -d $BOARD_NET -j MASQUERADE 2>/dev/null || true
   $FW -D FORWARD -d 10.10.10.14/31 -j DROP 2>/dev/null || true
   $FW -D FORWARD -d 10.10.10.16/31 -j DROP 2>/dev/null || true
   ip netns del $CLIENT_NS 2>/dev/null || true

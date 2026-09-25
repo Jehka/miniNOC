@@ -1,169 +1,160 @@
-# Mini-NoC — 8-endpoint packet interconnect (spec v0.3.0)
+# Mini-NoC
 
-Packet-switched interconnect: 8 bidirectional endpoints plus a shared-memory
-endpoint, through a 9x10 crossbar. Per-output round-robin arbitration with
-whole-packet locking and lossless ready/valid backpressure. SystemVerilog,
-closing timing at 70 MHz on a ZedBoard (xc7z020-1).
+A packet-switched network-on-chip and the SoC around it, built from scratch in
+SystemVerilog and running on a ZedBoard — with every endpoint reachable as a
+host on a real IP network.
+
+Nothing here is vendor IP wired together. The flit format, crossbar, arbiter,
+FIFOs, memory adapter, AXI4-Lite bridge and hardware forwarding table are all
+original RTL. So is the software that puts them on a network. The only vendor
+parts are the Zynq processing system, its Ethernet MAC, and lwIP.
+
+**Send a UDP datagram to `10.10.10.13` and it arrives at endpoint 3**, because a
+forwarding table in the PL looked up the address and rewrote the packet header.
+Move that endpoint to a different address while traffic is flowing, and it keeps
+working. Deny endpoints 4-7 with a router ACL, and 0-3 carry on.
+
+![Wireshark decoding a memory read response from the fabric](pictures/n3_feedface.png)
+
+*A memory read crossing the crossbar, leaving the FPGA and decoded field by
+field on the wire: the four `0xfeedface` words were read out of BRAM inside the
+PL.*
+
+---
+
+## What it does
+
+**The interconnect.** Eight bidirectional endpoints plus a shared-memory
+endpoint exchange variable-length packets through a 9x10 crossbar. Per-output
+round-robin arbitration with whole-packet locking, lossless ready/valid
+backpressure, destination latched at start of packet, illegal destinations drained
+to a sink port so a bad header cannot block an input.
+
+![Architecture](pictures/architecture.jpg)
+
+**The SoC.** An AXI4-Lite bridge replaces one endpoint's traffic generator, so
+the Zynq PS injects and receives flits. A 16-entry IPv4-to-endpoint forwarding
+table sits on the datapath and is writable at runtime.
+
+![Block design](pictures/block_design.png)
+
+**The network.** lwIP on the PS carries UDP datagrams to and from the bridge.
+Nine IPv4 addresses answer ARP and ICMP behind one MAC, each mapping to an
+endpoint. A control port lets the host read and rewrite the forwarding table
+while the board is running.
 
 ```
-EP0..EP7 TX FIFO --> [ 9x10 crossbar      ] --> EP0..EP7 RX FIFO
-MEM responses    --> [ per-output RR +    ] --> MEM requests --> memory_adapter <--> BRAM
-                     [ lock-on-grant      ] --> SINK (illegal DST_ID)
+host 10.10.10.1 ──Ethernet──► Zynq PS (lwIP) ──AXI-Lite──► fwd_table ──flits──► endpoints
+                  10.10.10.10 .. .17 = endpoints 0-7       10.10.10.18 = shared memory
 ```
 
-Track B extends this to a real IP network: each endpoint gets its own address,
-reachable with ordinary tools, with a runtime-writable forwarding table in the
-PL. See `docs/network_integration.md`.
+---
 
-| Document | Contents |
-|---|---|
-| `BUILD.md` | How to build and run, verification status, timing history |
-| `PLAN.md` | What is done and what is next, both tracks |
-| `docs/packet_noc_design_spec_v0_3_0.docx` | Design specification (source: `docs/spec_v0_2.md`) |
-| `docs/network_integration.md` | Network integration spec: address plan, encapsulation, error mapping |
-| `docs/p0_decisions.md` | Review of the v0.1 spec and the decisions taken |
+## Results
 
-## Status
+|                 |                                                                             |
+| --------------- | --------------------------------------------------------------------------- |
+| Timing          | **Closes at 70 MHz** on xc7z020-1; measured ceiling 73.6 MHz          |
+| Hardware        | Zero errors under randomised receive backpressure                           |
+| Verification    | Reference-model scoreboard;**11 of 11 mutation bugs caught**          |
+| Area            | 7518 LUTs (14%), 4114 registers, 2 BRAM, including the self-test harness    |
+| MMIO throughput | 3.4 MB/s each way, ~285 ns per bus access                                   |
+| Network         | All nine addresses reachable; routing by address; live remap; ACL filtering |
 
-| Milestone | State | Evidence |
-|---|---|---|
-| P0 Protocol | Frozen in v0.2 | `docs/p0_decisions.md`, spec sections 4-9 |
-| P1 Arbiter | Pass | `tb_rr_arbiter`, N = 5, 8, 9: directed, rotation, packet-lock fairness, 20k random vs model, reset |
-| P2 FIFO | Pass | `tb_sync_fifo`, DEPTH = 2, 16, 64: fill/drain, 20k random-stall scoreboard, stability, reset |
-| P3 Switch | Pass | `tb_noc_top`: 8 inputs → one output, fairness bound incl. first-packet wait |
-| P4 Crossbar | Pass | Permutation traffic drives all 8 outputs in the same cycle |
-| P5 Endpoints | Pass | Any-to-any, header-only, packets longer than the FIFO |
-| P6 Memory | Pass | Reference model; boundaries, zero-length read, all 4 error codes |
-| P7 System | Pass | Random traffic + memory + illegal DST + stray flits + random stalls, counters, reset/recovery; FIFO depth 2/4/16/64 × seeds |
-| P8 FPGA | Fixes applied, re-run pending | `tb_zed_selftest` passes and detects an injected bit flip. **First Vivado run: WNS -6.466 ns. Two fixes applied (see below); implementation not yet re-run.** |
+![Timing met](pictures/timing.png)
 
-Mutation testing (`make mutate`): 9/9 injected bugs caught, including the v0.1
-lock-on-header-transfer rule (M1).
+The critical path is the arbitration loop — one input's destination decides
+another input's ready — at 82% routing across 13 logic levels. That is the
+73.6 MHz ceiling, and lifting it needs credit-based flow control, not tuning.
+The full closure history, from WNS -6.466 ns, is in the report.
+
+![Critical path](pictures/critical_path.png)
+
+---
+
+## Verified on hardware
+
+**The fabric**, with eight on-chip generators and checkers driving it:
+
+![Board running the self-test](pictures/board.JPG)
+
+**Every endpoint answers as a host**, all behind one MAC:
+
+![ping](pictures/ping1.png)
+![arp -a showing several addresses on one MAC](pictures/arp.png)
+
+**Errors surface on the wire** with the code, the source endpoint and the tag of
+the request that caused them:
+
+![N5 error paths](pictures/wireshark_n5_error.png)
+
+**An endpoint moves address while running**, with no rebuild and no reboot:
+
+![Live remap](pictures/remap.png)
+
+**A router ACL filters the endpoint address space**, two hops away:
+
+![N6 routed hop and ACL](pictures/n6.png)
+
+**The testbenches are proven to catch bugs**, not merely to pass:
+
+![Mutation testing](pictures/make.png)
+
+---
 
 ## Layout
 
 ```
 rtl/      noc_pkg, rr_arbiter, sync_fifo, skid_reg, bram_sdp, endpoint_port,
-          route_decode, output_port_ctrl, noc_switch, memory_adapter, noc_top
-tb/       tb_rr_arbiter, tb_sync_fifo, tb_noc_top (system scoreboard), tb_zed_selftest
-fpga/     ep_traffic (generator/checker), zed_top, zedboard.xdc, build.tcl
-net/      noc_dissector.lua (Wireshark), noc_scapy.py (traffic + error suite),
-          netns_lab.sh (routed hop + ACL lab)
-scripts/  mutate.sh, spec_to_docx.js
-docs/     design spec, network integration spec, P0 review
+          route_decode, output_port_ctrl, noc_switch, memory_adapter, noc_top,
+          axil_noc_bridge (AXI4-Lite), fwd_table (IPv4 -> endpoint)
+tb/       arbiter, FIFO, system scoreboard, board self-test, bridge + forwarding
+fpga/     ep_traffic, zed_top, zedboard.xdc, build.tcl        (self-test design)
+          n1_top, n1.xdc, n1_bd.tcl                           (PS + bridge design)
+sw/       noc_bridge (driver), noc_udp (UDP + control plane), noc_alias (ARP/ICMP),
+          n1_main (AXI-Lite acceptance), n3_main (networked application)
+net/      noc_dissector.lua, n3_test.py, n4_remap.py, n5_errors.py, n6_lab.sh,
+          make_test_pcap.py
+docs/     consolidated report, design spec, network spec, v0.1 review
+pictures/ captures and photographs
 ```
 
-## Network tooling (track B)
+## Build and run
+
+Simulation needs Verilator 5.x:
 
 ```
-wireshark -X lua_script:net/noc_dissector.lua          # decode NoC on the wire
-sudo python3 net/noc_scapy.py --iface eth0 errors      # drive every error code
-sudo ./net/netns_lab.sh up eth0 && sudo ./net/netns_lab.sh acl
+make lint          make unit          make regress
+make selftest      make n1            make mutate
 ```
 
-## Running
-
-Needs Verilator ≥ 5.0 (developed on 5.020).
+FPGA, from the repository root:
 
 ```
-make lint                     # -Wall, noc_top and zed_top
-make unit                     # P1, P2
-make sys DEPTH=16 SEED=3      # P3–P7 system test
-make regress                  # depths 2/4/16/64 × seeds 1–3
-make selftest                 # board self-test in simulation (+ fault injection)
-make mutate                   # ~1 min per mutant
-make all
+vivado -mode batch -source fpga/build.tcl     # self-test bitstream
+vivado -mode batch -source fpga/n1_bd.tcl     # PS + bridge, exports n1.xsa
 ```
 
-## ZedBoard (P8)
+Then build the Vitis application from `sw/` on the exported platform. Host-side,
+with the board at 10.10.10.10 and the laptop at 10.10.10.1:
 
 ```
-vivado -mode batch -source fpga/build.tcl            # bitstream + timing/util reports in build/vivado
-vivado -mode batch -source fpga/build.tcl -tclargs ila
+python net/n3_test.py --by-address    # routing by destination address
+python net/n4_remap.py                # move an endpoint to a new address, live
+python net/n5_errors.py               # every error path, from the host
+sudo ./net/n6_lab.sh up && sudo ./net/n6_lab.sh acl && sudo ./net/n6_lab.sh test
 ```
 
-| Control | Function |
-|---|---|
-| SW0 | Traffic enable |
-| SW1 | Random RX backpressure |
-| BTNC | Reset |
-| LD0 | Heartbeat (1 Hz; derived from the CLK_HZ parameter) |
-| LD1 | PASS: no error, ≥1024 memory cycles, ≥100k packets |
-| LD2 | Error (sticky) |
-| LD3 | Sink/framing counter nonzero (should stay off) |
-| LD7:4 | First error code, or rx-activity nibble |
+For Wireshark, copy `net/noc_dissector.lua` into the personal plugins folder and
+filter on `noc`. `net/make_test_pcap.py` writes a synthetic capture so the
+decoder can be checked without hardware.
 
-Error codes: 1 sequence/ordering, 2 payload, 3 length/EOP, 4 wrong destination,
-5 memory data, 6 unexpected response, 7 response watchdog, 8 framing.
+`BUILD.md` has the full build notes, including the two BSP settings that are not
+defaults and the stale-bitstream traps. `PLAN.md` tracks what is done and what is
+open. `docs/mini_noc_complete_report.docx` is the consolidated report: design
+specification, network specification, results and retrospective.
 
-Check `fpga/zedboard.xdc` bank 34/35 IOSTANDARD against your VADJ jumper (J18)
-before programming.
+## Status
 
-### Timing history
-
-First implementation run (Vivado 2025.2, 100 MHz): **WNS -6.466 ns**, 2116
-failing endpoints. Every failing path ran from an endpoint TX FIFO through
-route decode, the output-8 arbiter and the crossbar mux into the memory
-adapter — 30 logic levels, 15-17 CARRY4.
-
-Measured on xc7z020-1, 100 MHz target, routed:
-
-| Version | WNS | Critical path |
-|---|---|---|
-| v0.2 | -6.466 ns | EP TX FIFO → route decode → arbiter → mux → memory adapter |
-| v0.2.2 | -3.528 ns | route decode → `stat_rx_pkts` 32-bit counter |
-| v0.2.3 | -3.582 ns | input skid DST_ID → route → arbiter → another input's ready |
-| v0.3.0 | closes @ 70 MHz | clock lowered to the measured maximum |
-
-Fix in v0.2.3:
-- Status counters pipelined. The event condition fed a 32-bit carry chain in the
-  same cycle it was computed; event bits and their population count are now
-  registered first. Debug logic was setting the clock ceiling.
-
-Fix in v0.2.2:
-- Each switch input has a flop-based register slice (`rtl/skid_reg.sv`), so
-  arbitration starts at a flip-flop instead of a FIFO LUTRAM read plus three LUT
-  levels of route decode — about 3.5 ns of the failing path. No latency cost at
-  full rate; all 8 outputs still transfer in the same cycle in P4.
-
-Two fixes in v0.2.1:
-- `noc_top` registers the switch-to-memory request channel (depth-2 skid FIFO),
-  removing ~9.5 ns of arbitration delay from in front of the adapter.
-- `memory_adapter` does address range and burst checks in MEM_AW+2 bits instead
-  of 65, removing the carry chains.
-
-Both verified in simulation (system tests at depths 2/4/16, seeds 1-3; board
-self-test; memory mutants M6/M8 still caught). **No corrected bitstream has been produced yet.** The three timing reports so
-far are all byte-identical (WNS -6.466, TNS -5981.686, 2116 endpoints) and all
-show 65-bit `burst_end` carry chains and no `u_mem_req_skid`, so they are runs
-of the pre-v0.2.1 sources. `fpga/build.tcl` uses relative paths and picks up
-whatever `rtl/` sits under the launch directory. Verify with the SKID PRESENT
-line it now prints after synthesis: zero means the old tree.
-
-### Why 70 MHz
-
-The final path is the arbitration loop: one input's DST_ID decides another
-input's ready. At 82% routing over 13 logic levels it is wire-dominated, so
-removing logic returns little. 12.989 ns of data path needs ~13.58 ns with skew
-and uncertainty: **73.6 MHz is this architecture's ceiling on xc7z020-1.** The
-fabric runs at 70 MHz from an MMCM (100 MHz in, VCO 700 MHz, /10) with ~0.7 ns
-margin, and reset is held until lock.
-
-Lifting it means credit-based flow control with registered ready, which changes
-the flow-control contract — a v0.4 project, not a tuning pass. 100 MHz was only
-ever the board oscillator frequency, not a requirement.
-
-### Superseded notes
-
-The remaining path will be datapath, and routing was already 73% of the
-v0.2.2 path, so pipelining returns less than it did. Options in order:
-
-A register slice on each switch output remains available if a future version
-needs it, at one cycle of latency per packet and no throughput cost.
-
-## Verilator 5.020 notes
-
-The testbenches contain workarounds for three simulator issues:
-- Local queues inside automatic tasks are not re-initialised per call, so they are cleared explicitly.
-- Arrays of queues with a non-power-of-2 dimension generate invalid C++. The scoreboard uses a flat `[128][$]` array.
-- Comments beginning `// Verilator` are parsed as metacomments.
+Both tracks complete on hardware. Open: fabric-only area figure, AXI-DMA in place
+of MMIO, and credit-based flow control to lift the frequency ceiling.

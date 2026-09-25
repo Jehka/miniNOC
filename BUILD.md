@@ -1,3 +1,4 @@
+
 # Build and status
 
 ## What exists
@@ -15,8 +16,11 @@ tb/       tb_rr_arbiter, tb_sync_fifo, tb_noc_top (system scoreboard),
           tb_zed_selftest (board self-test), tb_n1_bridge (bridge + forwarding)
 fpga/     ep_traffic (generator + checker), zed_top, zedboard.xdc, build.tcl  (track A)
           n1_top, n1.xdc, n1_bd.tcl                                          (track B)
-sw/       noc_bridge.h/.c (bare-metal driver), n1_main.c (hardware acceptance test)
-net/      noc_dissector.lua, noc_scapy.py, netns_lab.sh   (network tooling, not yet used)
+sw/       noc_bridge.h/.c (bare-metal driver), n1_main.c (AXI-Lite acceptance test),
+          noc_udp.h/.c (UDP bridging), noc_alias.h/.c (ARP/ICMP for nine addresses),
+          n3_main.c (the networked application)
+net/      noc_dissector.lua (Wireshark), n3_test.py, n4_remap.py, n5_errors.py,
+          n6_lab.sh (routed hop + ACL), make_test_pcap.py
 scripts/  mutate.sh, spec_to_docx.js
 docs/     design spec v0.3.0, network integration spec v0.4, P0 review
 ```
@@ -113,6 +117,11 @@ It is set to LVCMOS18.
 | Bridge + forwarding, simulation (`make n1`)       | **Pass**                                                         |
 | N1 bridge, hardware                                 | **Pass** — all checks, 1000-packet soak, 3.4 MB/s MMIO baseline |
 | N4 forwarding table, hardware                       | **Pass** — route by IP, miss discard, live remap, invalidation  |
+| N2 Ethernet (lwIP echo)                             | **Pass** — 1000 Mbps, ping and TCP echo                         |
+| N3 encapsulation (`net/n3_test.py`)               | **Pass** — loopback, memory, error path, malformed rejected     |
+| N4 ARP and control plane                            | **Pass** — nine addresses on one MAC; live remap from the host  |
+| N5 error paths (`net/n5_errors.py`)               | **Pass** — every code, sink path, counters                      |
+| N6 routed hop and ACL (`net/n6_lab.sh`)           | **Pass** — endpoints 0-3 permitted, 4-7 denied, no NAT          |
 
 Utilization, track A (includes the 8 self-test generators, not fabric-only):
 7518 LUTs (14%), 750 LUTRAM, 4114 registers (3.9%), 2 BRAM. The N1 design adds
@@ -151,7 +160,44 @@ ready, which changes the flow-control contract in design spec section 3.
 at 66.67 MHz because the PS derives FCLK by integer division and exactly 70 MHz
 is not available.
 
+## Network stages
+
+Host-side tooling needs only Python and Wireshark; nothing is installed on the board
+beyond the Vitis application.
+
+```
+python net/n3_test.py                # encapsulation, port 5556
+python net/n3_test.py --by-address   # routing by destination address, port 5555
+python net/n4_remap.py --show        # read the live forwarding table
+python net/n4_remap.py               # move an endpoint to a new address, live
+python net/n5_errors.py              # every error path, from the host
+python net/make_test_pcap.py         # synthetic capture for the dissector
+```
+
+The routed-hop lab needs Linux, or WSL2 with `networkingMode=mirrored`:
+
+```
+sudo ./net/n6_lab.sh up
+sudo ./net/n6_lab.sh test            # all nine reachable, two hops away
+sudo ./net/n6_lab.sh acl             # deny endpoints 4-7
+sudo ./net/n6_lab.sh test            # .10-.13 answer, .14-.17 do not
+sudo ./net/n6_lab.sh down
+```
+
+For Wireshark, copy `net/noc_dissector.lua` into the personal plugins folder
+(`%APPDATA%\Wireshark\plugins` on Windows) and press Ctrl+Shift+L to reload.
+The display filter is `noc`.
+
+### BSP settings that are not the defaults
+
+`lwip220_dhcp` false: a direct cable has no DHCP server, and the echo template
+waits in its DHCP loop forever, printing nothing after the PHY messages.
+
+`lwip220_lwip_dhcp_does_acd_check` false: lwIP 2.2.0 refuses to compile with
+address conflict detection enabled and DHCP disabled.
+
 ## Next
 
-See `PLAN.md`. Without an Ethernet cable: test the Wireshark dissector on a saved
-capture, and write the lwIP application for N3. With one: N2 onward.
+See `PLAN.md`. Both tracks are complete; the open items are the fabric-only
+utilization figure, the write-up, and optionally N7 (AXI-DMA) against the
+measured 3.4 MB/s MMIO baseline.
